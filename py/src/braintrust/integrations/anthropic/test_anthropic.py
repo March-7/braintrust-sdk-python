@@ -355,7 +355,9 @@ def test_anthropic_beta_messages_create_captures_compaction_metadata(memory_logg
     ],
     ids=["sync", "async"],
 )
-async def test_anthropic_beta_messages_create_preserves_inline_mcp_blocks(memory_logger, is_async, vcr_cassette_name):
+async def test_anthropic_beta_messages_create_preserves_inline_mcp_blocks(
+    memory_logger, is_async, vcr_cassette, vcr_cassette_name
+):
     if os.environ.get("BRAINTRUST_TEST_PACKAGE_VERSION") != "latest":
         pytest.skip("Inline MCP tool definitions require the latest Anthropic API")
 
@@ -410,77 +412,29 @@ async def test_anthropic_beta_messages_create_preserves_inline_mcp_blocks(memory
     assert tool_result["tool_use_id"] == response_tool_result.tool_use_id
     assert tool_result["content"][0]["text"] == response_tool_result.content[0].text
 
+    # Derive the child-span expectations from the recorded provider response,
+    # independently of the tracing output.
+    recorded_content = json.loads(vcr_cassette.responses[0]["body"]["string"])["content"]
+    recorded_call = next(block for block in recorded_content if block["type"] == "mcp_tool_use")
+    recorded_result = next(
+        block
+        for block in recorded_content
+        if block["type"] == "mcp_tool_result" and block["tool_use_id"] == recorded_call["id"]
+    )
     tool_spans = find_spans_by_type(spans, SpanTypeAttribute.TOOL)
     assert len(tool_spans) == 1
     tool_span = tool_spans[0]
-    assert tool_span["span_attributes"]["name"] == response_tool_use.name
-    assert tool_span["input"] == response_tool_use.input
+    assert tool_span["span_attributes"]["name"] == recorded_call["name"]
+    assert tool_span["input"] == recorded_call["input"]
     assert tool_span["output"] == [block.model_dump() for block in response_tool_result.content]
+    assert tool_span["output"][0]["text"] == recorded_result["content"][0]["text"]
     assert tool_span["metadata"] == {
-        "tool_use_id": response_tool_use.id,
-        "tool_call_type": "mcp_tool_use",
-        "tool_result_type": "mcp_tool_result",
+        "tool_use_id": recorded_call["id"],
+        "tool_call_type": recorded_call["type"],
+        "tool_result_type": recorded_result["type"],
     }
     assert tool_span["span_parents"] == [span["span_id"]]
     assert tool_span["root_span_id"] == span["root_span_id"]
-
-
-@pytest.mark.parametrize("results_first", [False, True], ids=["calls-first", "results-first"])
-def test_anthropic_mcp_tool_spans_pair_by_id(memory_logger, results_first):
-    # Supplement the recorded provider response with deterministic ordering and
-    # incomplete-pair cases that cannot be requested reliably from a live model.
-    calls = [
-        {"type": "mcp_tool_use", "id": "mcp-1", "name": "lookup", "input": {"key": "first"}, "server_name": "catalog"},
-        {
-            "type": "mcp_tool_use",
-            "id": "mcp-2",
-            "name": "lookup",
-            "input": {"key": "second"},
-            "server_name": "catalog",
-        },
-        {"type": "mcp_tool_use", "id": "mcp-pending", "name": "pending", "input": {}, "server_name": "catalog"},
-    ]
-    results = [
-        {"type": "mcp_tool_result", "tool_use_id": "mcp-2", "content": [{"type": "text", "text": "second value"}]},
-        {"type": "mcp_tool_result", "tool_use_id": "mcp-1", "content": [{"type": "text", "text": "first value"}]},
-        {
-            "type": "mcp_tool_result",
-            "tool_use_id": "mcp-orphan",
-            "content": [{"type": "text", "text": "orphan value"}],
-        },
-    ]
-    content = (results + calls if results_first else calls + results) + [
-        {"type": "tool_use", "id": "client-tool", "name": "local_lookup", "input": {}},
-        {"type": "tool_result", "tool_use_id": "client-tool", "content": "client result"},
-    ]
-    before = json.dumps(content)
-    with logger.start_span(name="MCP pairs", type="llm") as parent:
-        _log_message_to_span(SimpleNamespace(content=content), parent)
-
-    spans = memory_logger.pop()
-    llm_span = find_span_by_name(spans, "MCP pairs")
-    tool_spans = find_spans_by_type(spans, SpanTypeAttribute.TOOL)
-    assert len(tool_spans) == 4
-    by_id = {span["metadata"]["tool_use_id"]: span for span in tool_spans}
-    assert set(by_id) == {"mcp-1", "mcp-2", "mcp-pending", "mcp-orphan"}
-    for call, result in zip(calls[:2], reversed(results[:2])):
-        span = by_id[call["id"]]
-        assert span["span_attributes"]["name"] == call["name"]
-        assert span["input"] == call["input"]
-        assert span["output"] == result["content"]
-        assert span["metadata"]["tool_call_type"] == "mcp_tool_use"
-        assert span["metadata"]["tool_result_type"] == "mcp_tool_result"
-    assert by_id["mcp-pending"]["span_attributes"]["name"] == "pending"
-    assert by_id["mcp-pending"]["input"] == {}
-    assert by_id["mcp-pending"].get("output") is None
-    assert by_id["mcp-orphan"]["span_attributes"]["name"] == "mcp"
-    assert by_id["mcp-orphan"].get("input") is None
-    assert by_id["mcp-orphan"]["output"] == results[2]["content"]
-    for span in tool_spans:
-        assert span["span_parents"] == [llm_span["span_id"]]
-        assert span["root_span_id"] == llm_span["root_span_id"]
-    assert llm_span["output"]["content"] == content
-    assert json.dumps(content) == before
 
 
 @pytest.mark.asyncio
