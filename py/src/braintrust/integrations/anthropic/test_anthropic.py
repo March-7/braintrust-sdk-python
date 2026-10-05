@@ -21,7 +21,7 @@ from braintrust.integrations.anthropic.tracing import (
 from braintrust.integrations.test_utils import verify_autoinstrument_script
 from braintrust.span_types import SpanTypeAttribute
 from braintrust.test_helpers import find_span_by_name, find_spans_by_type, init_test_logger
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 
 
 PROJECT_NAME = "test-anthropic-app"
@@ -437,78 +437,86 @@ async def test_anthropic_beta_messages_create_preserves_inline_mcp_blocks(
     assert tool_span["root_span_id"] == span["root_span_id"]
 
 
+@pytest.mark.vcr(match_on=["method", "scheme", "host", "port", "path", "body"])
 @pytest.mark.asyncio
-@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
-async def test_anthropic_mcp_stream_accumulates_tool_input(memory_logger, is_async):
+@pytest.mark.parametrize(
+    "is_async,vcr_cassette_name",
+    [
+        (False, "test_anthropic_mcp_stream_accumulates_tool_input"),
+        (True, "test_anthropic_mcp_stream_accumulates_tool_input"),
+    ],
+    ids=["sync", "async"],
+)
+async def test_anthropic_mcp_stream_accumulates_tool_input(memory_logger, is_async, vcr_cassette, vcr_cassette_name):
     if os.environ.get("BRAINTRUST_TEST_PACKAGE_VERSION") != "latest":
         pytest.skip("MCP stream events require the latest Anthropic SDK")
 
-    # Supplemental typed-event coverage: no MCP SSE cassette is available.
-    # Split input across deltas to exercise the real SDK stream accumulator.
-    call = {
-        "type": "mcp_tool_use",
-        "id": "mcp-1",
-        "name": "lookup",
-        "input": {"key": "record"},
-        "server_name": "catalog",
+    client = wrap_anthropic(_get_async_client() if is_async else _get_client())
+    params = {
+        "model": LATEST_MODEL,
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Use ask_wiki_question for repository braintrustdata/braintrust-sdk-python. "
+                    "Ask this exact question: Give a detailed explanation of the SDK's primary "
+                    "implementation language, the package and source directory where it lives, "
+                    "and how a contributor would run its focused tests. Include enough detail "
+                    "to fully answer each part, and then briefly summarize the result."
+                ),
+            }
+        ],
+        "mcp_servers": [
+            {
+                "type": "url",
+                "name": "braintrust-test",
+                "url": "https://mcp.deepwiki.com/mcp",
+            }
+        ],
+        "tools": [{"type": "mcp_toolset", "mcp_server_name": "braintrust-test"}],
+        "betas": ["mcp-client-2026-09-15"],
     }
-    result = {
-        "type": "mcp_tool_result",
-        "tool_use_id": "mcp-1",
-        "is_error": False,
-        "content": [{"type": "text", "text": "found"}],
-    }
-    wire_events = [
-        {
-            "type": "message_start",
-            "message": {
-                "id": "msg_mcp",
-                "type": "message",
-                "role": "assistant",
-                "model": LATEST_MODEL,
-                "content": [],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            },
-        },
-        {"type": "content_block_start", "index": 0, "content_block": dict(call, input={})},
-        {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": '{"key":'}},
-        {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": ' "record"}'},
-        },
-        {"type": "content_block_stop", "index": 0},
-        {"type": "content_block_start", "index": 1, "content_block": result},
-        {"type": "content_block_stop", "index": 1},
-        {"type": "message_stop"},
-    ]
-    adapter = TypeAdapter(anthropic.types.beta.BetaRawMessageStreamEvent)
-    events = [adapter.validate_python(event) for event in wire_events]
-    before = [event.model_dump() for event in events]
 
-    async def async_events():
-        for event in events:
-            yield event
+    if is_async:
+        async with client.beta.messages.stream(**params) as stream:
+            events = [event async for event in stream]
+            message = await stream.get_final_message()
+    else:
+        with client.beta.messages.stream(**params) as stream:
+            events = list(stream)
+            message = stream.get_final_message()
 
-    with logger.start_span(name="MCP stream", type="llm") as parent:
-        source = async_events() if is_async else iter(events)
-        stream = TracedMessageStream(source, parent, time.time())
-        observed = [event async for event in stream] if is_async else list(stream)
-        stream._log_final_message()
-    assert observed == events
-    assert [event.model_dump() for event in events] == before
+    # Confirm the recording contains split input deltas; that is the provider
+    # behavior the beta accumulator must reassemble.
+    body = vcr_cassette.responses[0]["body"]["string"]
+    if isinstance(body, bytes):
+        body = body.decode()
+    input_json_deltas = []
+    for line in body.splitlines():
+        if not line.startswith("data: "):
+            continue
+        event = json.loads(line[6:])
+        if event.get("type") == "content_block_delta" and event.get("delta", {}).get("type") == "input_json_delta":
+            input_json_deltas.append(event)
+    assert len(input_json_deltas) > 1
+
+    call = next(block for block in message.content if block.type == "mcp_tool_use")
+    result = next(block for block in message.content if block.type == "mcp_tool_result")
+    assert any(event.type == "content_block_delta" for event in events)
     spans = memory_logger.pop()
-    parent = find_span_by_name(spans, "MCP stream")
+    parent = find_span_by_name(spans, "anthropic.messages.stream")
     tool_spans = find_spans_by_type(spans, SpanTypeAttribute.TOOL)
     assert len(tool_spans) == 1
     child = tool_spans[0]
-    assert child["span_attributes"]["name"] == call["name"]
-    assert child["input"] == call["input"]
-    assert child["output"][0]["text"] == "found"
-    assert child["metadata"]["tool_use_id"] == call["id"]
+    assert child["span_attributes"]["name"] == call.name
+    assert child["input"] == call.input
+    assert child["output"] == [block.model_dump() for block in result.content]
+    assert child["metadata"]["tool_use_id"] == call.id
     assert child["metadata"]["tool_call_type"] == "mcp_tool_use"
     assert child["span_parents"] == [parent["span_id"]]
-    assert parent["output"]["content"][0]["input"] == call["input"]
+    parent_call = next(block for block in parent["output"]["content"] if block["type"] == "mcp_tool_use")
+    assert parent_call["input"] == call.input
 
 
 @pytest.mark.vcr(match_on=["method", "scheme", "host", "port", "path", "body"])
